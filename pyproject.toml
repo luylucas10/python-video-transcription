@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=82", "wheel"]
+build-backend = "setuptools.build_meta"
+[project]
+name = "video-to-text"
+version = "0.1.0"
+description = "Transcreve vídeos MP4 da raiz de E:/obs para Markdown usando GPU NVIDIA."
+readme = "README.md"
+requires-python = ">=3.11,<3.13"
+authors = [{ name = "Local Workspace" }]
+dependencies = [
+  "faster-whisper>=1.2.0,<2.0.0",
+  "tiktoken>=0.7.0,<2.0.0",
+]
+[project.optional-dependencies]
+dev = [
+  "pyinstaller>=6.14.1,<7.0.0",
+  "pytest>=8.4.0,<9.0.0",
+]
+[project.scripts]
+video-to-text = "video_to_text.app:main"
+[tool.setuptools]
+package-dir = { "" = "src" }
+[tool.setuptools.packages.find]
+where = ["src"]
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
