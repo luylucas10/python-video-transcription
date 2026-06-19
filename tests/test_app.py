@@ -1,8 +1,9 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import json
 from datetime import UTC, datetime
 from pathlib import Path
+from unittest import mock
 
 import pytest
 
@@ -29,6 +30,21 @@ class FailingTranscriber:
         raise RuntimeError("GPU crashed")
 
 
+class FailAfterNTranscriber:
+    """Succeeds on the first N calls, then raises."""
+
+    def __init__(self, result: TranscriptResult, succeed_count: int = 1) -> None:
+        self.result = result
+        self.succeed_count = succeed_count
+        self.calls: list[Path] = []
+
+    def transcribe(self, video_path: Path) -> TranscriptResult:
+        self.calls.append(video_path)
+        if len(self.calls) <= self.succeed_count:
+            return self.result
+        raise RuntimeError("GPU crashed on second video")
+
+
 @pytest.fixture()
 def transcript_result() -> TranscriptResult:
     return TranscriptResult(
@@ -50,7 +66,6 @@ def temp_settings(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> app.AppSet
     state_directory = tmp_path / "state"
     log_directory = tmp_path / "logs"
 
-    monkeypatch.setattr(app, "DEFAULT_WATCH_DIRECTORY", watch_directory)
     monkeypatch.setattr(app, "default_state_directory", lambda: state_directory)
     monkeypatch.setattr(app, "default_log_directory", lambda: log_directory)
 
@@ -389,6 +404,35 @@ def test_format_timestamp(seconds: float, expected: str) -> None:
 
 
 # ---------------------------------------------------------------------------
+# parse_args — model argument
+# ---------------------------------------------------------------------------
+
+def test_parse_args_default_model_is_large_v3(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(app, "prompt_for_directory", lambda: Path("/tmp/videos"))
+    settings = app.parse_args([])
+    assert settings.model_name == "large-v3"
+
+
+def test_parse_args_accepts_huggingface_model_id(tmp_path: Path) -> None:
+    settings = app.parse_args(["--model", "Systran/faster-whisper-large-v3", "-d", str(tmp_path)])
+    assert settings.model_name == "Systran/faster-whisper-large-v3"
+
+
+def test_parse_args_accepts_local_model_path(tmp_path: Path) -> None:
+    local_path = str(tmp_path / "models" / "faster-whisper-large-v3")
+    settings = app.parse_args(["--model", local_path, "-d", str(tmp_path)])
+    assert settings.model_name == local_path
+
+
+def test_build_transcriber_passes_model_name(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    local_model_path = str(tmp_path / "my-model")
+    monkeypatch.setattr(app, "default_state_directory", lambda: tmp_path / "state")
+    settings = app.AppSettings(model_name=local_model_path, watch_directory=tmp_path)
+    transcriber = app.build_transcriber(settings)
+    assert transcriber.model_name == local_model_path
+
+
+# ---------------------------------------------------------------------------
 # tokenizer — count_tokens and build_chunks
 # ---------------------------------------------------------------------------
 
@@ -463,3 +507,299 @@ def test_build_chunks_token_count_is_positive_for_non_empty_text() -> None:
     assert chunks[0].token_count > 0
 
 
+# ---------------------------------------------------------------------------
+# 4.1 parse_args — input selection
+# ---------------------------------------------------------------------------
+
+def test_parse_args_dir_sets_watch_directory(tmp_path: Path) -> None:
+    settings = app.parse_args(["-d", str(tmp_path)])
+    assert settings.watch_directory == tmp_path
+    assert settings.video_paths == ()
+
+
+def test_parse_args_long_dir_flag(tmp_path: Path) -> None:
+    settings = app.parse_args(["--dir", str(tmp_path)])
+    assert settings.watch_directory == tmp_path
+
+
+def test_parse_args_single_video(tmp_path: Path) -> None:
+    video = tmp_path / "aula.mp4"
+    settings = app.parse_args(["-v", str(video)])
+    assert settings.video_paths == (video,)
+    assert settings.watch_directory is None
+
+
+def test_parse_args_multiple_videos(tmp_path: Path) -> None:
+    v1 = tmp_path / "a.mp4"
+    v2 = tmp_path / "b.mp4"
+    settings = app.parse_args(["-v", str(v1), "-v", str(v2)])
+    assert settings.video_paths == (v1, v2)
+
+
+def test_parse_args_long_video_flag(tmp_path: Path) -> None:
+    video = tmp_path / "aula.mp4"
+    settings = app.parse_args(["--video", str(video)])
+    assert settings.video_paths == (video,)
+
+
+def test_parse_args_dir_and_video_are_mutually_exclusive(tmp_path: Path) -> None:
+    video = tmp_path / "aula.mp4"
+    with pytest.raises(SystemExit):
+        app.parse_args(["-d", str(tmp_path), "-v", str(video)])
+
+
+def test_parse_args_no_input_prompts_for_directory(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(app, "prompt_for_directory", lambda: tmp_path)
+    settings = app.parse_args([])
+    assert settings.watch_directory == tmp_path
+    assert settings.video_paths == ()
+
+
+def test_parse_args_with_dir_does_not_prompt(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    prompted = []
+    monkeypatch.setattr(app, "prompt_for_directory", lambda: prompted.append(True) or tmp_path)
+    app.parse_args(["-d", str(tmp_path)])
+    assert not prompted
+
+
+def test_parse_args_with_video_does_not_prompt(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    prompted = []
+    monkeypatch.setattr(app, "prompt_for_directory", lambda: prompted.append(True) or tmp_path)
+    app.parse_args(["-v", str(tmp_path / "a.mp4")])
+    assert not prompted
+
+
+# ---------------------------------------------------------------------------
+# 4.2 validate_inputs — failures before transcriber loading
+# ---------------------------------------------------------------------------
+
+def test_run_raises_for_nonexistent_watch_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, transcript_result: TranscriptResult
+) -> None:
+    monkeypatch.setattr(app, "default_state_directory", lambda: tmp_path / "state")
+    settings = app.AppSettings(watch_directory=tmp_path / "nonexistent", stability_wait_seconds=0.0)
+    transcriber = FakeTranscriber(transcript_result)
+
+    with pytest.raises(FileNotFoundError):
+        app.run(settings, transcriber=transcriber)
+
+    assert transcriber.calls == []
+
+
+def test_run_raises_for_missing_explicit_video(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, transcript_result: TranscriptResult
+) -> None:
+    monkeypatch.setattr(app, "default_state_directory", lambda: tmp_path / "state")
+    missing = tmp_path / "missing.mp4"
+    settings = app.AppSettings(video_paths=(missing,), stability_wait_seconds=0.0)
+    transcriber = FakeTranscriber(transcript_result)
+
+    with pytest.raises(FileNotFoundError):
+        app.run(settings, transcriber=transcriber)
+
+    assert transcriber.calls == []
+
+
+def test_run_raises_for_non_mp4_explicit_video(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, transcript_result: TranscriptResult
+) -> None:
+    monkeypatch.setattr(app, "default_state_directory", lambda: tmp_path / "state")
+    bad_file = tmp_path / "video.avi"
+    bad_file.write_bytes(b"data")
+    settings = app.AppSettings(video_paths=(bad_file,), stability_wait_seconds=0.0)
+    transcriber = FakeTranscriber(transcript_result)
+
+    with pytest.raises(ValueError):
+        app.run(settings, transcriber=transcriber)
+
+    assert transcriber.calls == []
+
+
+# ---------------------------------------------------------------------------
+# 4.3 explicit video — output beside source + state behavior
+# ---------------------------------------------------------------------------
+
+def test_run_writes_markdown_beside_explicit_video(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, transcript_result: TranscriptResult
+) -> None:
+    videos_dir = tmp_path / "courses"
+    videos_dir.mkdir()
+    video = videos_dir / "aula.mp4"
+    video.write_bytes(b"video")
+    monkeypatch.setattr(app, "default_state_directory", lambda: tmp_path / "state")
+
+    settings = app.AppSettings(video_paths=(video,), stability_wait_seconds=0.0)
+    app.run(settings, transcriber=FakeTranscriber(transcript_result))
+
+    expected_md = videos_dir / "aula.md"
+    assert expected_md.exists()
+    assert "Olá mundo." in expected_md.read_text(encoding="utf-8")
+
+
+def test_run_explicit_video_order_preserved(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, transcript_result: TranscriptResult
+) -> None:
+    v1 = tmp_path / "z_last.mp4"
+    v2 = tmp_path / "a_first.mp4"
+    v1.write_bytes(b"v1")
+    v2.write_bytes(b"v2")
+    monkeypatch.setattr(app, "default_state_directory", lambda: tmp_path / "state")
+
+    transcriber = FakeTranscriber(transcript_result)
+    settings = app.AppSettings(video_paths=(v1, v2), stability_wait_seconds=0.0)
+    app.run(settings, transcriber=transcriber)
+
+    # explicit order: v1 first, then v2 (not alphabetical)
+    assert transcriber.calls == [v1, v2]
+
+
+def test_run_explicit_video_skips_already_processed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, transcript_result: TranscriptResult
+) -> None:
+    video = tmp_path / "aula.mp4"
+    video.write_bytes(b"video")
+    md = video.with_suffix(".md")
+    md.write_text("existente", encoding="utf-8")
+    state_dir = tmp_path / "state"
+    monkeypatch.setattr(app, "default_state_directory", lambda: state_dir)
+
+    fingerprint = app.fingerprint_file(video)
+    settings = app.AppSettings(video_paths=(video,), stability_wait_seconds=0.0)
+    app.save_state(
+        settings.state_file,
+        {
+            "version": 1,
+            "videos": {
+                app.normalize_path(video): {
+                    "size_bytes": fingerprint.size_bytes,
+                    "modified_time_ns": fingerprint.modified_time_ns,
+                }
+            },
+        },
+    )
+    transcriber = FakeTranscriber(transcript_result)
+
+    summary = app.run(settings, transcriber=transcriber)
+
+    assert summary.skipped_count == 1
+    assert transcriber.calls == []
+
+
+def test_run_explicit_video_reprocess_overrides_state(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, transcript_result: TranscriptResult
+) -> None:
+    video = tmp_path / "aula.mp4"
+    video.write_bytes(b"video")
+    md = video.with_suffix(".md")
+    md.write_text("antigo", encoding="utf-8")
+    state_dir = tmp_path / "state"
+    monkeypatch.setattr(app, "default_state_directory", lambda: state_dir)
+
+    fingerprint = app.fingerprint_file(video)
+    settings = app.AppSettings(video_paths=(video,), stability_wait_seconds=0.0, reprocess=True)
+    app.save_state(
+        settings.state_file,
+        {
+            "version": 1,
+            "videos": {
+                app.normalize_path(video): {
+                    "size_bytes": fingerprint.size_bytes,
+                    "modified_time_ns": fingerprint.modified_time_ns,
+                }
+            },
+        },
+    )
+    transcriber = FakeTranscriber(transcript_result)
+
+    summary = app.run(settings, transcriber=transcriber)
+
+    assert summary.processed_count == 1
+    assert transcriber.calls == [video]
+
+
+# ---------------------------------------------------------------------------
+# 4.4 device fallback
+# ---------------------------------------------------------------------------
+
+def test_run_with_fallback_gpu_success_no_cpu_used(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, transcript_result: TranscriptResult
+) -> None:
+    watch = tmp_path / "videos"
+    watch.mkdir()
+    (watch / "aula.mp4").write_bytes(b"v")
+    monkeypatch.setattr(app, "default_state_directory", lambda: tmp_path / "state")
+
+    settings = app.AppSettings(watch_directory=watch, stability_wait_seconds=0.0)
+    gpu_transcriber = FakeTranscriber(transcript_result)
+    cpu_transcriber = FakeTranscriber(transcript_result)
+
+    summary = app.run_with_fallback(settings, primary_transcriber=gpu_transcriber, fallback_transcriber=cpu_transcriber)
+
+    assert summary.processed_count == 1
+    assert gpu_transcriber.calls != []
+    assert cpu_transcriber.calls == []
+
+
+def test_run_with_fallback_first_video_failure_triggers_cpu(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, transcript_result: TranscriptResult
+) -> None:
+    watch = tmp_path / "videos"
+    watch.mkdir()
+    (watch / "aula.mp4").write_bytes(b"v")
+    monkeypatch.setattr(app, "default_state_directory", lambda: tmp_path / "state")
+
+    settings = app.AppSettings(watch_directory=watch, stability_wait_seconds=0.0)
+    gpu_transcriber = FailingTranscriber()
+    cpu_transcriber = FakeTranscriber(transcript_result)
+
+    summary = app.run_with_fallback(settings, primary_transcriber=gpu_transcriber, fallback_transcriber=cpu_transcriber)
+
+    assert summary.processed_count == 1
+    assert cpu_transcriber.calls != []
+
+
+def test_run_with_fallback_gpu_load_failure_triggers_cpu(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, transcript_result: TranscriptResult
+) -> None:
+    watch = tmp_path / "videos"
+    watch.mkdir()
+    (watch / "aula.mp4").write_bytes(b"v")
+    state_dir = tmp_path / "state"
+    monkeypatch.setattr(app, "default_state_directory", lambda: state_dir)
+
+    settings = app.AppSettings(watch_directory=watch, stability_wait_seconds=0.0)
+    cpu_transcriber = FakeTranscriber(transcript_result)
+
+    def failing_build(s: app.AppSettings) -> app.FasterWhisperTranscriber:
+        raise RuntimeError("CUDA not available")
+
+    monkeypatch.setattr(app, "build_transcriber", failing_build)
+
+    # No primary injected → run_with_fallback calls build_transcriber which fails
+    # fallback_transcriber is injected so it doesn't also call build_transcriber
+    summary = app.run_with_fallback(settings, fallback_transcriber=cpu_transcriber)
+
+    assert summary.processed_count == 1
+    assert cpu_transcriber.calls != []
+
+
+def test_run_with_fallback_no_switch_after_first_gpu_success(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, transcript_result: TranscriptResult
+) -> None:
+    watch = tmp_path / "videos"
+    watch.mkdir()
+    (watch / "a.mp4").write_bytes(b"v1")
+    (watch / "b.mp4").write_bytes(b"v2")
+    monkeypatch.setattr(app, "default_state_directory", lambda: tmp_path / "state")
+
+    settings = app.AppSettings(watch_directory=watch, stability_wait_seconds=0.0)
+    # Succeeds on first video, fails on second
+    gpu_transcriber = FailAfterNTranscriber(transcript_result, succeed_count=1)
+    cpu_transcriber = FakeTranscriber(transcript_result)
+
+    summary = app.run_with_fallback(settings, primary_transcriber=gpu_transcriber, fallback_transcriber=cpu_transcriber)
+
+    # Second video failure goes to failed_files, not CPU fallback
+    assert summary.processed_count == 1
+    assert len(summary.failed_files) == 1
+    assert cpu_transcriber.calls == []

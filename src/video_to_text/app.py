@@ -1,11 +1,13 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import argparse
+import dataclasses
 import logging
 import sys
 import time
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from enum import Enum
 from pathlib import Path
 from typing import Iterable
 
@@ -14,18 +16,19 @@ from video_to_text.tokenizer import ENCODING_NAME, TranscriptChunk, build_chunks
 from video_to_text.transcriber import FasterWhisperTranscriber, TranscriptResult, Transcriber
 
 APP_NAME = "video-to-text"
-DEFAULT_WATCH_DIRECTORY = Path(r"E:\obs")
 DEFAULT_MODEL_NAME = "large-v3"
+
+
+class PromptType(Enum):
+    TECH = "Conteúdo técnico de software. Mantenha termos em inglês (API, framework, library, deploy, etc.) e nomes de produtos exatamente como pronunciados. Use português formal."
+    MEETING = "Reunião corporativa. Use português formal. Mantenha nomes de empresas, produtos e pessoas exatamente como pronunciados. Minimize palavras de hesitação."
+    GENERAL = None
 
 # Guard to prevent configure_logging from adding duplicate handlers on repeated calls
 _logging_configured = False
 
 
 def get_app_base_directory() -> Path:
-    """Returns the folder containing the executable (packaged) or the project root (dev mode)."""
-    if getattr(sys, "frozen", False):
-        # Running as PyInstaller bundle — place data next to the .exe
-        return Path(sys.executable).parent
     # __file__ is src/video_to_text/app.py — three parents up reaches the project root
     return Path(__file__).resolve().parents[2]
 
@@ -44,7 +47,8 @@ def default_log_directory() -> Path:
 
 @dataclass(frozen=True, slots=True)
 class AppSettings:
-    watch_directory: Path = DEFAULT_WATCH_DIRECTORY
+    watch_directory: Path | None = None
+    video_paths: tuple[Path, ...] = ()
     model_name: str = DEFAULT_MODEL_NAME
     device: str = "cuda"
     # float16 maps directly to RTX 3090 tensor cores (no conversion overhead)
@@ -61,6 +65,16 @@ class AppSettings:
     stability_checks: int = 2
     # Maximum tokens per RAG chunk written to the markdown file (cl100k_base encoding)
     max_tokens_per_chunk: int = 500
+    # Initial prompt to guide transcription (tech, meeting, general, or custom)
+    initial_prompt: str | None = None
+    # Threshold for no-speech detection (0.0-1.0, higher = more sensitive to silence)
+    no_speech_threshold: float = 0.6
+    # Compression ratio threshold to detect gibberish hallucinations (typical: 2.4)
+    compression_ratio_threshold: float = 2.4
+    # Log probability threshold to filter low-confidence segments (typical: -1.0)
+    log_prob_threshold: float = -1.0
+    # Temperature for decoding (0.0 = deterministic, >0 = sampling)
+    temperature: float = 0.0
 
     @property
     def state_directory(self) -> Path:
@@ -96,6 +110,10 @@ class RunSummary:
     failed_files: tuple[str, ...]
 
 
+class _EarlyDeviceFailure(Exception):
+    """Raised when the active transcriber fails before any video is successfully processed."""
+
+
 def configure_logging(log_file: Path) -> None:
     global _logging_configured
     if _logging_configured:
@@ -119,8 +137,31 @@ def configure_logging(log_file: Path) -> None:
     _logging_configured = True
 
 
+def prompt_for_directory() -> Path:
+    path = input("Digite o caminho do diretório a escanear: ").strip()
+    return Path(path)
+
+
 def parse_args(argv: list[str] | None = None) -> AppSettings:
-    parser = argparse.ArgumentParser(description="Transcreve .mp4 da raiz de E:\\obs para .md")
+    parser = argparse.ArgumentParser(description="Transcreve .mp4 para .md usando faster-whisper")
+
+    input_group = parser.add_mutually_exclusive_group()
+    input_group.add_argument(
+        "-d", "--dir",
+        dest="watch_dir",
+        type=Path,
+        metavar="DIR",
+        help="Diretório a escanear (raiz apenas, sem subpastas)",
+    )
+    input_group.add_argument(
+        "-v", "--video",
+        dest="video_paths",
+        action="append",
+        type=Path,
+        metavar="VIDEO",
+        help="Arquivo de vídeo .mp4 específico (pode ser repetido)",
+    )
+
     parser.add_argument("--dry-run", action="store_true", help="Mostra o que seria processado sem transcrever")
     parser.add_argument("--reprocess", action="store_true", help="Ignora o estado salvo e processa novamente")
     parser.add_argument("--language", default="pt", help="Idioma para transcrição (padrão: pt). Use 'auto' para detecção automática.")
@@ -139,8 +180,58 @@ def parse_args(argv: list[str] | None = None) -> AppSettings:
     )
     parser.add_argument("--stability-wait-seconds", type=float, default=2.0, help="Espera entre verificações de estabilidade do arquivo")
     parser.add_argument("--stability-checks", type=int, default=2, help="Quantidade de comparações para detectar arquivo em escrita")
+    parser.add_argument(
+        "--prompt-type",
+        choices=["tech", "meeting", "general"],
+        default="general",
+        help="Preset de prompt inicial: 'tech' para vídeos técnicos, 'meeting' para reuniões, 'general' sem prompt (padrão: general)",
+    )
+    parser.add_argument(
+        "--initial-prompt",
+        default=None,
+        help="Prompt inicial customizado (sobrescreve --prompt-type)",
+    )
+    parser.add_argument(
+        "--no-speech-threshold",
+        type=float,
+        default=0.6,
+        help="Limite para detecção de silêncio (0.0-1.0, padrão: 0.6)",
+    )
+    parser.add_argument(
+        "--compression-ratio-threshold",
+        type=float,
+        default=2.4,
+        help="Limite de compressão para detectar alucinações (padrão: 2.4)",
+    )
+    parser.add_argument(
+        "--log-prob-threshold",
+        type=float,
+        default=-1.0,
+        help="Limite de log-probability para filtrar segmentos baixa confiança (padrão: -1.0)",
+    )
+    parser.add_argument(
+        "--temperature",
+        type=float,
+        default=0.0,
+        help="Temperatura para decodificação (0.0=determinístico, >0=sampling, padrão: 0.0)",
+    )
     arguments = parser.parse_args(argv)
+
+    watch_directory: Path | None = arguments.watch_dir
+    video_paths: tuple[Path, ...] = tuple(arguments.video_paths or [])
+
+    if watch_directory is None and not video_paths:
+        watch_directory = prompt_for_directory()
+
+    # Resolve initial_prompt: custom flag overrides preset
+    initial_prompt = arguments.initial_prompt
+    if initial_prompt is None:
+        prompt_type = PromptType[arguments.prompt_type.upper()]
+        initial_prompt = prompt_type.value
+
     return AppSettings(
+        watch_directory=watch_directory,
+        video_paths=video_paths,
         model_name=arguments.model,
         language=None if arguments.language.lower() in ("auto", "") else arguments.language,
         dry_run=arguments.dry_run,
@@ -149,6 +240,11 @@ def parse_args(argv: list[str] | None = None) -> AppSettings:
         max_tokens_per_chunk=max(1, arguments.max_tokens_per_chunk),
         stability_wait_seconds=max(0.0, arguments.stability_wait_seconds),
         stability_checks=max(1, arguments.stability_checks),
+        initial_prompt=initial_prompt,
+        no_speech_threshold=max(0.0, min(1.0, arguments.no_speech_threshold)),
+        compression_ratio_threshold=max(0.0, arguments.compression_ratio_threshold),
+        log_prob_threshold=arguments.log_prob_threshold,
+        temperature=max(0.0, arguments.temperature),
     )
 
 
@@ -162,12 +258,60 @@ def build_transcriber(settings: AppSettings) -> FasterWhisperTranscriber:
         batch_size=settings.batch_size,
         vad_filter=settings.vad_filter,
         download_root=settings.model_cache_directory,
+        initial_prompt=settings.initial_prompt,
+        no_speech_threshold=settings.no_speech_threshold,
+        compression_ratio_threshold=settings.compression_ratio_threshold,
+        log_prob_threshold=settings.log_prob_threshold,
+        temperature=settings.temperature,
     )
 
 
-def run(settings: AppSettings, transcriber: Transcriber | None = None) -> RunSummary:
-    logging.info("Iniciando processamento em %s", settings.watch_directory)
-    validate_watch_directory(settings.watch_directory)
+def _cpu_fallback_settings(settings: AppSettings) -> AppSettings:
+    return dataclasses.replace(settings, device="cpu", compute_type="int8")
+
+
+def validate_watch_directory(watch_directory: Path) -> None:
+    if not watch_directory.exists():
+        raise FileNotFoundError(f"Diretório não encontrado: {watch_directory}")
+    if not watch_directory.is_dir():
+        raise NotADirectoryError(f"Caminho inválido (não é um diretório): {watch_directory}")
+
+
+def _validate_video_paths(paths: tuple[Path, ...]) -> None:
+    for path in paths:
+        if not path.exists():
+            raise FileNotFoundError(f"Vídeo não encontrado: {path}")
+        if not path.is_file() or path.suffix.lower() != ".mp4":
+            raise ValueError(f"Arquivo inválido (deve ser um .mp4 existente): {path}")
+
+
+def validate_inputs(settings: AppSettings) -> None:
+    if settings.video_paths:
+        _validate_video_paths(settings.video_paths)
+    elif settings.watch_directory is not None:
+        validate_watch_directory(settings.watch_directory)
+
+
+def iter_root_videos(watch_directory: Path) -> Iterable[Path]:
+    for entry in sorted(watch_directory.iterdir(), key=lambda item: item.name.lower()):
+        if entry.is_file() and entry.suffix.lower() == ".mp4":
+            yield entry
+
+
+def iter_eligible_videos(settings: AppSettings) -> Iterable[Path]:
+    if settings.video_paths:
+        yield from settings.video_paths
+    elif settings.watch_directory is not None:
+        yield from iter_root_videos(settings.watch_directory)
+
+
+def run(settings: AppSettings, transcriber: Transcriber | None = None, *, _allow_early_failure: bool = False) -> RunSummary:
+    if settings.video_paths:
+        logging.info("Iniciando processamento de %d vídeo(s) selecionado(s)", len(settings.video_paths))
+    else:
+        logging.info("Iniciando processamento em %s", settings.watch_directory)
+
+    validate_inputs(settings)
     active_transcriber = transcriber or build_transcriber(settings)
     state = load_state(settings.state_file)
     known_videos = state.setdefault("videos", {})
@@ -177,7 +321,7 @@ def run(settings: AppSettings, transcriber: Transcriber | None = None) -> RunSum
     pending_count = 0
     failed_files: list[str] = []
 
-    for video_path in iter_root_videos(settings.watch_directory):
+    for video_path in iter_eligible_videos(settings):
         fingerprint = fingerprint_file(video_path)
         output_path = video_path.with_suffix(".md")
         normalized_path = normalize_path(video_path)
@@ -202,7 +346,9 @@ def run(settings: AppSettings, transcriber: Transcriber | None = None) -> RunSum
         try:
             result = active_transcriber.transcribe(video_path)
             write_markdown(output_path, video_path, result, started_at, datetime.now(UTC), settings.max_tokens_per_chunk)
-        except Exception:
+        except Exception as exc:
+            if _allow_early_failure and processed_count == 0:
+                raise _EarlyDeviceFailure(str(exc)) from exc
             failed_files.append(str(video_path))
             logging.exception("Falha ao transcrever %s", video_path)
             continue
@@ -233,17 +379,31 @@ def run(settings: AppSettings, transcriber: Transcriber | None = None) -> RunSum
     )
 
 
-def validate_watch_directory(watch_directory: Path) -> None:
-    if not watch_directory.exists():
-        raise FileNotFoundError(f"Diretório não encontrado: {watch_directory}")
-    if not watch_directory.is_dir():
-        raise NotADirectoryError(f"Caminho inválido (não é um diretório): {watch_directory}")
+def run_with_fallback(
+    settings: AppSettings,
+    primary_transcriber: Transcriber | None = None,
+    fallback_transcriber: Transcriber | None = None,
+) -> RunSummary:
+    if primary_transcriber is None:
+        try:
+            primary = build_transcriber(settings)
+        except Exception as exc:
+            logging.warning("Falha ao carregar modelo GPU: %s. Usando fallback CPU.", exc)
+            cpu = _cpu_fallback_settings(settings)
+            logging.info("Fallback CPU: device=%s compute_type=%s", cpu.device, cpu.compute_type)
+            fallback = fallback_transcriber or build_transcriber(cpu)
+            return run(cpu, transcriber=fallback)
+    else:
+        primary = primary_transcriber
 
-
-def iter_root_videos(watch_directory: Path) -> Iterable[Path]:
-    for entry in sorted(watch_directory.iterdir(), key=lambda item: item.name.lower()):
-        if entry.is_file() and entry.suffix.lower() == ".mp4":
-            yield entry
+    try:
+        return run(settings, transcriber=primary, _allow_early_failure=True)
+    except _EarlyDeviceFailure as exc:
+        logging.warning("GPU falhou antes de processar qualquer vídeo: %s. Usando fallback CPU.", exc)
+        cpu = _cpu_fallback_settings(settings)
+        logging.info("Fallback CPU: device=%s compute_type=%s", cpu.device, cpu.compute_type)
+        fallback = fallback_transcriber or build_transcriber(cpu)
+        return run(cpu, transcriber=fallback)
 
 
 def fingerprint_file(video_path: Path) -> VideoFingerprint:
@@ -396,7 +556,7 @@ def main(argv: list[str] | None = None) -> int:
     settings = parse_args(argv)
     configure_logging(settings.log_file)
     try:
-        summary = run(settings)
+        summary = run_with_fallback(settings)
     except Exception:
         logging.exception("Execução encerrada com erro")
         return 1

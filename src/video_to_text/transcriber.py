@@ -39,6 +39,11 @@ class FasterWhisperTranscriber:
         batch_size: int,
         vad_filter: bool,
         download_root: Path,
+        initial_prompt: str | None = None,
+        no_speech_threshold: float = 0.6,
+        compression_ratio_threshold: float = 2.4,
+        log_prob_threshold: float = -1.0,
+        temperature: float = 0.0,
     ) -> None:
         self.model_name = model_name
         self.device = device
@@ -48,6 +53,11 @@ class FasterWhisperTranscriber:
         self.batch_size = batch_size
         self.vad_filter = vad_filter
         self.download_root = download_root
+        self.initial_prompt = initial_prompt
+        self.no_speech_threshold = no_speech_threshold
+        self.compression_ratio_threshold = compression_ratio_threshold
+        self.log_prob_threshold = log_prob_threshold
+        self.temperature = temperature
         self._active: Any = None
         self._use_batched: bool = False
 
@@ -85,23 +95,29 @@ class FasterWhisperTranscriber:
     def transcribe(self, video_path: Path) -> TranscriptResult:
         self._ensure_loaded()
 
+        common_kwargs = {
+            "beam_size": self.beam_size,
+            "language": self.language,
+            "task": "transcribe",
+            "vad_filter": self.vad_filter,
+            "initial_prompt": self.initial_prompt,
+            "no_speech_threshold": self.no_speech_threshold,
+            "compression_ratio_threshold": self.compression_ratio_threshold,
+            "log_prob_threshold": self.log_prob_threshold,
+            "temperature": self.temperature,
+        }
+
         if self._use_batched:
             segments, info = self._active.transcribe(
                 str(video_path),
                 batch_size=self.batch_size,
-                beam_size=self.beam_size,
-                language=self.language,
-                task="transcribe",
-                vad_filter=self.vad_filter,
+                **common_kwargs,
             )
         else:
             segments, info = self._active.transcribe(
                 str(video_path),
-                beam_size=self.beam_size,
-                language=self.language,
-                task="transcribe",
-                vad_filter=self.vad_filter,
                 condition_on_previous_text=True,
+                **common_kwargs,
             )
 
         collected_segments = [
