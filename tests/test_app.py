@@ -803,3 +803,76 @@ def test_run_with_fallback_no_switch_after_first_gpu_success(
     assert summary.processed_count == 1
     assert len(summary.failed_files) == 1
     assert cpu_transcriber.calls == []
+
+
+# ---------------------------------------------------------------------------
+# Cross-platform behavior: POSIX paths and model cache
+# ---------------------------------------------------------------------------
+
+
+def test_parse_args_accepts_posix_style_paths(tmp_path: Path) -> None:
+    posix_dir = "/tmp/videos"
+    settings = app.parse_args(["-d", posix_dir])
+    # Path normalizes to platform conventions (e.g., backslashes on Windows)
+    assert settings.watch_directory == Path(posix_dir)
+
+
+def test_parse_args_accepts_posix_video_paths(tmp_path: Path) -> None:
+    posix_video = "/home/user/videos/aula.mp4"
+    settings = app.parse_args(["-v", posix_video])
+    # Path normalizes to platform conventions
+    assert settings.video_paths[0] == Path(posix_video)
+
+
+def test_model_cache_uses_home_directory(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    fake_home = tmp_path / "home" / "user"
+    fake_home.mkdir(parents=True)
+    monkeypatch.setattr("pathlib.Path.home", lambda: fake_home)
+
+    settings = app.AppSettings(watch_directory=tmp_path)
+    expected_cache_dir = fake_home / ".cache" / "video-to-text" / "models"
+    assert settings.model_cache_directory == expected_cache_dir
+
+
+def test_model_cache_directory_created_on_access(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    fake_home = tmp_path / "home" / "user"
+    fake_home.mkdir(parents=True)
+    monkeypatch.setattr("pathlib.Path.home", lambda: fake_home)
+
+    settings = app.AppSettings(watch_directory=tmp_path)
+    cache_dir = settings.model_cache_directory
+
+    assert cache_dir.exists()
+    assert cache_dir.is_dir()
+
+
+def test_build_markdown_with_posix_path(transcript_result: TranscriptResult) -> None:
+    posix_path = Path("/home/user/videos/aula.mp4")
+    content = app.build_markdown(
+        posix_path,
+        transcript_result,
+        datetime(2026, 4, 28, 10, 0, tzinfo=UTC),
+        datetime(2026, 4, 28, 10, 5, tzinfo=UTC),
+    )
+
+    assert "# Transcrição de aula.mp4" in content
+    # The path may be platform-normalized (backslashes on Windows), just verify it contains the video name
+    assert "aula.mp4" in content
+    assert "source:" in content
+
+
+def test_run_explicit_video_creates_markdown_beside_posix_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, transcript_result: TranscriptResult
+) -> None:
+    videos_dir = tmp_path / "videos"
+    videos_dir.mkdir()
+    video = videos_dir / "aula.mp4"
+    video.write_bytes(b"video")
+    monkeypatch.setattr(app, "default_state_directory", lambda: tmp_path / "state")
+
+    settings = app.AppSettings(video_paths=(video,), stability_wait_seconds=0.0)
+    app.run(settings, transcriber=FakeTranscriber(transcript_result))
+
+    expected_md = video.with_suffix(".md")
+    assert expected_md.exists()
+    assert expected_md.read_text(encoding="utf-8") != ""
